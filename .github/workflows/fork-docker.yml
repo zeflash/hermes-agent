@@ -1,0 +1,167 @@
+name: Fork Docker image
+
+# Keep the publisher separate from application changes submitted upstream.
+# Pushes build the unmodified baseline; dispatch can select a later source SHA
+# once this workflow is also available on the fork's default branch.
+on:
+  push:
+    branches: [fork/docker-publish]
+    paths: [.github/workflows/fork-docker.yml]
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full source commit SHA to build (default is upstream v0.22.2)
+        required: true
+        default: d923a5eb487a17c0a68801bba9ef0f56c81040a8
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    if: github.repository == 'zeflash/hermes-agent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit || 'd923a5eb487a17c0a68801bba9ef0f56c81040a8' }}
+      IMAGE: ghcr.io/zeflash/hermes-agent
+      TEST_IMAGE: hermes-fork:test
+    steps:
+      - name: Validate source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          echo "HERMES_HOME=$RUNNER_TEMP/hermes-build-home" >> "$GITHUB_ENV"
+          echo "HERMES_RUNTIME_DIR=$RUNNER_TEMP/hermes-build-runtime" >> "$GITHUB_ENV"
+
+      - name: Checkout application source, not the publisher branch
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # GitHub forks do not automatically inherit upstream release tags.
+      - name: Fetch upstream version tags for the install stamp
+        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'
+
+      - name: Set up Python for build provenance
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Record source and image identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain)"
+          display="$(python3 -m scripts.releases.distance)"
+          identity=(--commit "$SOURCE_COMMIT")
+          if [ -n "$display" ]; then
+            base="${display%%+*}"
+            development="${display#*+}"
+            if [ "$development" = "$display" ]; then distance=0; else distance="${development%%.*}"; fi
+            identity+=(--base-version "$base" --display-version "$display" --distance "$distance")
+          fi
+          python3 scripts/write_install_stamp.py --output install-stamp.json \
+            --distribution docker --update-mechanism external --source ci "${identity[@]}"
+          python3 scripts/ci/check_profile_archive_boundary.py
+          echo "tag=sha-${SOURCE_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "version=${display:-git.${SOURCE_COMMIT:0:7}}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build N100 image without publishing
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: HERMES_BOT_DESKTOP=0
+          labels: |
+            org.opencontainers.image.source=https://github.com/zeflash/hermes-agent
+            org.opencontainers.image.revision=${{ env.SOURCE_COMMIT }}
+            org.opencontainers.image.version=${{ steps.identity.outputs.version }}
+          cache-from: type=gha,scope=fork-docker-amd64
+          cache-to: type=gha,mode=max,scope=fork-docker-amd64
+
+      - name: Verify image architecture and source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$TEST_IMAGE" --format '{{.Architecture}}')" = amd64
+          actual="$(docker run --rm --entrypoint /opt/hermes/.venv/bin/python "$TEST_IMAGE" \
+            -c 'import json; print(json.load(open("/opt/hermes/install-stamp.json"))["commit"])')"
+          test "$actual" = "$SOURCE_COMMIT"
+
+      - name: Park image stamp while preparing the isolated test environment
+        run: mv install-stamp.json "$RUNNER_TEMP/fork-install-stamp.json"
+
+      - name: Prepare locked test dependencies
+        id: test-env
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '[]'
+          test-environment: 'true'
+          prune-python-cache: true
+
+      - name: Restore image stamp for provenance tests
+        run: mv "$RUNNER_TEMP/fork-install-stamp.json" install-stamp.json
+
+      - name: Run the upstream Docker integration suite
+        env:
+          HERMES_TEST_IMAGE: ${{ env.TEST_IMAGE }}
+          HERMES_PYTHON: ${{ steps.test-env.outputs.python-path }}
+          HERMES_TEST_WORKERS: '2'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: scripts/run_tests.sh tests/docker/
+
+      - name: Authenticate to GHCR only after tests pass
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the tested image without rebuilding
+        id: publish
+        env:
+          TAG: ${{ steps.identity.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          reference="${IMAGE}:${TAG}"
+          docker tag "$TEST_IMAGE" "$reference"
+          docker push "$reference"
+          digest="$(docker buildx imagetools inspect "$reference" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          {
+            echo '### Tested fork image'
+            echo
+            echo "Source commit: \`$SOURCE_COMMIT\`"
+            echo 'Platform: `linux/amd64`; standard image, without Bot Screen packages.'
+            echo
+            echo 'Deploy this exact digest in Compose:'
+            echo '```yaml'
+            echo "image: ${IMAGE}@${digest}"
+            echo '```'
+            echo
+            echo 'The SHA tag is a lookup convenience; pin the digest to prevent changes on a rebuild.'
+            echo 'For anonymous pulls, set the GHCR package visibility to Public after its first publication.'
+          } >> "$GITHUB_STEP_SUMMARY"
