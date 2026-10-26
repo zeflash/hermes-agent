@@ -593,7 +593,7 @@ def _extract_context(entry: dict[str, Any]) -> Optional[int]:
     return _extract_limit(entry, "context")
 
 
-def _extract_cost_tier(cost: Dict[str, Any], base: Dict[str, float]) -> Optional[Dict[str, float]]:
+def _extract_cost_tier(cost: dict[str, Any], base: dict[str, float]) -> Optional[dict[str, float]]:
     """Flatten the single context tier PricingEntry can represent; never discard other rules."""
     tiers = cost.get("tiers", [])
     if not isinstance(tiers, list):
@@ -617,7 +617,7 @@ def _extract_cost_tier(cost: Dict[str, Any], base: Dict[str, float]) -> Optional
     return {"tier_threshold_tokens": size, **{f"{key}_above": value for key, value in above.items()}}
 
 
-def _extract_cost(entry: Dict[str, Any]) -> Optional[Dict[str, float]]:
+def _extract_cost(entry: dict[str, Any]) -> Optional[dict[str, float]]:
     """USD/1M rates and a supported context tier, unscaled; incomplete rules remain unknown."""
     cost = entry.get("cost") if isinstance(entry, dict) else None
     if not isinstance(cost, dict):
@@ -639,7 +639,7 @@ def _extract_cost(entry: Dict[str, Any]) -> Optional[Dict[str, float]]:
 
 def lookup_models_dev_pricing(
     provider: str, model: str, *, allow_network: bool = False
-) -> Optional[Dict[str, float]]:
+) -> Optional[dict[str, float]]:
     """Provider-scoped per-million pricing from models.dev. Providers absent from
     :data:`PROVIDER_TO_MODELS_DEV` return ``None``; model ids are never scanned across vendors.
     ``allow_network`` defaults to False: usage accounting is a hot path."""

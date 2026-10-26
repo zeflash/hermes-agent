@@ -9,9 +9,7 @@ from decimal import Decimal
 import pytest
 import hermes_yaml as yaml
 
-import agent.model_metadata as model_metadata
-import agent.models_dev as models_dev
-import agent.usage_pricing as usage_pricing
+from agent import model_metadata, models_dev, usage_pricing
 from agent.usage_pricing import get_pricing_entry
 
 
@@ -125,8 +123,8 @@ def test_snapshot_miss_prices_from_models_dev(seeded_models_dev, default_source_
     entry = get_pricing_entry("relay-model-1", provider="opencode-go")
 
     assert entry is not None
-    assert entry.input_cost_per_million == Decimal("5")
-    assert entry.output_cost_per_million == Decimal("25")
+    assert entry.input_cost_per_million == Decimal(5)
+    assert entry.output_cost_per_million == Decimal(25)
     assert entry.cache_read_cost_per_million == Decimal("0.5")
     assert entry.cache_write_cost_per_million == Decimal("6.25")
     assert entry.pricing_version == "models-dev-api"
@@ -208,7 +206,7 @@ def test_curated_snapshot_still_precedes_external_catalog(
 
     assert entry is not None
     assert entry.pricing_version != "models-dev-api"
-    assert entry.input_cost_per_million != Decimal("999")
+    assert entry.input_cost_per_million != Decimal(999)
 
 
 @pytest.mark.parametrize("provider", [None, "unknown", "custom", "local", "xiaomi"])
@@ -264,7 +262,7 @@ def test_mapped_named_provider_reaches_models_dev_despite_unknown_billing_mode(
     entry = get_pricing_entry("mimo-new", provider="xiaomi")
 
     assert entry is not None
-    assert entry.input_cost_per_million == Decimal("1")
+    assert entry.input_cost_per_million == Decimal(1)
     assert entry.pricing_version == "models.dev"  # xiaomi is a direct first-party host on main
 
 
