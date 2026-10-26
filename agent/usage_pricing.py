@@ -6,6 +6,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone, UTC
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
+from urllib.parse import urlsplit
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata, strip_codex_context_variant_suffix
 from utils import base_url_host_matches, base_url_hostname, base_url_origin
@@ -24,6 +25,12 @@ _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _MODELS_DEV_DIRECT_HOSTS = {
     "openai": "openai.com", "xai": "x.ai", "anthropic": "anthropic.com", "google": "googleapis.com",
     "deepseek": "deepseek.com", "xiaomi": "xiaomimimo.com",
+}
+# Zen and Go share a host but not a rate card. Include the path in the billing
+# boundary; neither a proxy nor the other product inherits these catalog prices.
+_MODELS_DEV_SCOPED_ENDPOINTS = {
+    "opencode-zen": ("opencode.ai", "/zen"),
+    "opencode-go": ("opencode.ai", "/zen/go"),
 }
 
 # Below $0.01, render at 4 dp so cheap-model costs never display as $0.00.
@@ -582,6 +589,20 @@ def _vendor_catalog_ids() -> frozenset:
     return frozenset(PROVIDER_TO_MODELS_DEV.get(p, p) for p in _MODELS_DEV_DIRECT_HOSTS)
 
 
+def _matches_scoped_catalog_endpoint(route: BillingRoute) -> bool:
+    endpoint = _MODELS_DEV_SCOPED_ENDPOINTS.get(route.provider)
+    if endpoint is None or not route.base_url:
+        return True
+    host, path = endpoint
+    url = urlsplit(route.base_url)
+    # The Anthropic transport removes /v1 because its SDK appends /v1/messages.
+    return (
+        base_url_origin(route.base_url) == ("https", host, 443)
+        and url.path.rstrip("/") in (path, path + "/v1")
+        and not (url.query or url.fragment or url.username or url.password)
+    )
+
+
 def _models_dev_scoped_pricing_entry(route: BillingRoute, *, cache_only: bool = False) -> Optional[PricingEntry]:
     """models.dev row scoped to the route's own provider (relays such as opencode-go carry their
     own). A provider whose models.dev catalog IS a first-party vendor's (xai-oauth -> xai,
@@ -590,7 +611,8 @@ def _models_dev_scoped_pricing_entry(route: BillingRoute, *, cache_only: bool = 
     from agent.models_dev import PROVIDER_TO_MODELS_DEV, lookup_models_dev_pricing
 
     mdev_id = PROVIDER_TO_MODELS_DEV.get(route.provider or "")
-    if not mdev_id or not route.model or mdev_id in _vendor_catalog_ids():
+    if (not mdev_id or not route.model or mdev_id in _vendor_catalog_ids()
+            or not _matches_scoped_catalog_endpoint(route)):
         return None
     cost = lookup_models_dev_pricing(route.provider, route.model, allow_network=False)
     if not cost:
@@ -629,7 +651,7 @@ def _pricing_source_order() -> tuple[str, ...]:
         if isinstance(candidate, str) and candidate.strip().lower() in _VALID_PRICING_SOURCES:
             primary = candidate.strip().lower()
     except Exception:
-        pass
+        logger.debug("Unable to read external pricing source preference", exc_info=True)
     return (primary, *(source for source in _VALID_PRICING_SOURCES if source != primary))
 
 
@@ -644,6 +666,7 @@ def _external_pricing_entry(
         try:
             entry = _PRICING_SOURCE_BUILDERS[source](route, cache_only=cache_only)
         except Exception:
+            logger.debug("External pricing source %s unavailable", source, exc_info=True)
             entry = None
         if entry is not None:
             return entry
