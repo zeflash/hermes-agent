@@ -826,34 +826,9 @@ def _context_length_from_model_payload(payload: dict[str, Any]) -> Optional[int]
     return int(raw) if isinstance(raw, (int, float)) and int(raw) > 0 else None
 
 
-# Generic ``/models`` pricing: an explicit ``unit`` beside the rates wins; without one, a token rate
-# at or above $0.001/token ($1,000/MTok — no real model charges that) can only be a per-million quote.
-_PRICING_UNIT_DIVISORS = {
-    "per_token": 1, "per_1k_tokens": 1_000, "per_thousand_tokens": 1_000,
-    "per_1m_tokens": 1_000_000, "per_million_tokens": 1_000_000,
-}
-_PER_MILLION_QUOTE_MIN = 0.001
-_TOKEN_RATE_FIELDS = ("prompt", "completion", "cache_read", "cache_write")
-
-
-def _normalize_token_rates(pricing: dict[str, Any], unit: Any) -> dict[str, Any]:
-    """Rescale the generic path's token rates to per-token strings (the contract usage_pricing
-    multiplies by 1e6), the way the Novita/DeepInfra branches already do for their known units."""
-    rates: dict[str, float] = {}
-    for key in _TOKEN_RATE_FIELDS:
-        try:
-            rates[key] = float(pricing[key])
-        except (KeyError, TypeError, ValueError):
-            continue
-    divisor = _PRICING_UNIT_DIVISORS.get(str(unit or "").strip().lower())
-    if divisor is None:
-        divisor = 1_000_000 if any(v >= _PER_MILLION_QUOTE_MIN for v in rates.values()) else 1
-    if divisor != 1:
-        pricing.update({key: str(value / divisor) for key, value in rates.items()})
-    return pricing
-
-
 def _extract_pricing(payload: dict[str, Any]) -> dict[str, Any]:
+    from agent.model_metadata_pricing import normalize_token_rates
+
     def _per_token(source: dict[str, Any], fields: dict[str, str], scale) -> dict[str, Any]:
         # Provider $/MTok (or Novita's 1/10_000-$ per M) -> per-token strings, the same path usage_pricing uses for OpenRouter.
         return {target: str(scale(float(source[key]))) for target, key in fields.items() if source.get(key) is not None}
@@ -882,7 +857,7 @@ def _extract_pricing(payload: dict[str, Any]) -> dict[str, Any]:
                     pricing[target] = normalized[alias]
                     break
         if pricing:
-            return _normalize_token_rates(pricing, normalized.get("unit"))
+            return normalize_token_rates(pricing, normalized.get("unit"))
     return {}
 
 
