@@ -28,12 +28,12 @@ def _fmt_est_cost(est_cost: float) -> str:
 
 def _estimate_cost(session_or_model: Dict[str, Any] | str, input_tokens: int = 0, output_tokens: int = 0, *, cache_read_tokens: int = 0,
                    cache_write_tokens: int = 0, provider: Optional[str] = None, base_url: Optional[str] = None) -> tuple[float, str]:
-    """Estimate the USD cost for a session row or a model/token tuple."""
+    """Read persisted session costs; estimate only an explicit model/token tuple."""
     if isinstance(session_or_model, dict):
         s = session_or_model
-        model = s.get("model") or ""
-        usage = CanonicalUsage(**{k: s.get(k) or 0 for k in _TOKEN_KEYS})
-        provider, base_url = s.get("billing_provider"), s.get("billing_base_url")
+        # Aggregates have lost call boundaries (including context-price tiers).
+        # A newly available catalog must not turn old unknown usage into known.
+        return float(s.get("estimated_cost_usd") or 0.0), s.get("cost_status") or "unknown"
     else:
         model = session_or_model or ""
         usage = CanonicalUsage(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
@@ -185,10 +185,11 @@ class InsightsEngine:
         if not sessions:
             return {"days": days, "source_filter": source, "empty": True, "overview": {}, "models": [], "platforms": [], "tools": [],
                     "skills": self._compute_skill_breakdown([]), "activity": {}, "top_sessions": []}
-        models = self._compute_model_breakdown(sessions, cutoff, source)
+        usage_rows = self._get_model_usage(cutoff, source)
+        models = self._compute_model_breakdown(sessions, cutoff, source, usage_rows=usage_rows)
         return {
             "days": days, "source_filter": source, "empty": False, "generated_at": time.time(),
-            "overview": self._compute_overview(sessions, message_stats, models),
+            "overview": self._compute_overview(sessions, message_stats, models, usage_rows=usage_rows),
             "models": models,
             "platforms": self._compute_platform_breakdown(sessions),
             "tools": self._compute_tool_breakdown(tool_usage),
@@ -268,7 +269,8 @@ class InsightsEngine:
 
     # -------------------------------------------------------------- Compute
 
-    def _compute_overview(self, sessions: List[Dict], message_stats: Dict, models: Optional[List[Dict]] = None) -> Dict:
+    def _compute_overview(self, sessions: List[Dict], message_stats: Dict, models: Optional[List[Dict]] = None,
+                          *, usage_rows: Optional[List[Dict]] = None) -> Dict:
         # Per-model breakdown includes auxiliary usage rows (vision/compression/
         # titles) plus reconciled residuals, while session counters carry
         # main-loop usage only — sum the breakdown when available so overview
@@ -279,13 +281,17 @@ class InsightsEngine:
         total_tool_calls = sum(s.get("tool_call_count") or 0 for s in sessions)
         total_messages = sum(s.get("message_count") or 0 for s in sessions)
         total_cost = actual_cost = 0.0
-        models_with_pricing, models_without_pricing, status_counts = set(), set(), Counter()
+        models_with_pricing, models_without_pricing, included_sessions = set(), set(), set()
+        unknown_sessions = {r["session_id"] for r in usage_rows or [] if (r.get("cost_status") or "unknown") == "unknown"}
         for s in sessions:
             model = s.get("model") or ""
             estimated, status = _estimate_cost(s)
             total_cost += estimated
             actual_cost += s.get("actual_cost_usd") or 0.0
-            status_counts[status] += 1
+            if status == "unknown":
+                unknown_sessions.add(s["id"])
+            elif status == "included":
+                included_sessions.add(s["id"])
             known = has_known_pricing(model, s.get("billing_provider"), s.get("billing_base_url"))
             (models_with_pricing if known else models_without_pricing).add(_short_model(model))
         if models:
@@ -311,11 +317,12 @@ class InsightsEngine:
             "date_range_end": max(started) if started else None,
             "models_with_pricing": sorted(models_with_pricing),
             "models_without_pricing": sorted(models_without_pricing),
-            "unknown_cost_sessions": status_counts["unknown"],
-            "included_cost_sessions": status_counts["included"],
+            "unknown_cost_sessions": len(unknown_sessions),
+            "included_cost_sessions": len(included_sessions - unknown_sessions),
         }
 
-    def _compute_model_breakdown(self, sessions: List[Dict], cutoff: float, source: str = None) -> List[Dict]:
+    def _compute_model_breakdown(self, sessions: List[Dict], cutoff: float, source: str = None,
+                                 *, usage_rows: Optional[List[Dict]] = None) -> List[Dict]:
         """Tokens/cost per model from session_model_usage, so a session that
         switched models via ``/model`` splits across every model it used.
         Sessions without per-model rows (pre-table data) fall back to their
@@ -334,17 +341,13 @@ class InsightsEngine:
                 d[key] += counts[key]
             d["total_tokens"] += sum(counts[k] for k in _TOKEN_KEYS)
             d["api_calls"] += counts["api_call_count"]
-            if stored_cost is None:
-                estimate, status = _estimate_cost(model, counts["input_tokens"], counts["output_tokens"], cache_read_tokens=counts["cache_read_tokens"],
-                                                  cache_write_tokens=counts["cache_write_tokens"], provider=provider or None, base_url=base_url)
-            else:
-                estimate, status = float(stored_cost or 0.0), cost_status or "unknown"
+            estimate, status = float(stored_cost or 0.0), cost_status or "unknown"
             d["cost"] += estimate
             d["actual_cost"] += float(actual_cost or 0.0)
-            d["cost_status"] = status
+            d["cost_status"] = "unknown" if "unknown" in (d.get("cost_status"), status) else status
             d["has_pricing"] = has_known_pricing(model, provider or None, base_url) or d.get("has_pricing", False)
         usage_totals = defaultdict(lambda: dict.fromkeys(count_keys, 0) | {"estimated_cost_usd": 0.0, "actual_cost_usd": 0.0})
-        for r in self._get_model_usage(cutoff, source):
+        for r in self._get_model_usage(cutoff, source) if usage_rows is None else usage_rows:
             totals: Dict[str, Any] = usage_totals[r["session_id"]]
             counts = {key: r[key] or 0 for key in count_keys}
             for key in count_keys:
@@ -352,7 +355,7 @@ class InsightsEngine:
             totals["estimated_cost_usd"] += r["estimated_cost_usd"] or 0.0
             totals["actual_cost_usd"] += r["actual_cost_usd"] or 0.0
             _accumulate(r["model"], r["billing_provider"], r.get("billing_base_url"), r["session_id"], counts,
-                        stored_cost=r["estimated_cost_usd"] if r.get("cost_status") or r.get("cost_source") else None,
+                        stored_cost=r["estimated_cost_usd"],
                         actual_cost=r["actual_cost_usd"], cost_status=r.get("cost_status"))
         # Reconcile against the aggregate row: covers legacy sessions,
         # interrupted migrations, and absolute cumulative updates without
@@ -503,7 +506,7 @@ class InsightsEngine:
         lines += [f"  Avg msgs/session:  {o['avg_messages_per_session']:.1f}", ""]
         # Cost buckets: show included/unknown sessions instead of collapsing to $0.
         cost_lines = self._cost_lines(o, ("  Estimated:          {}", "  Included:           {} session(s) (subscription — no provider invoice)",
-                                          "  Unknown:            {} session(s) (no pricing data)"))
+                                          "  Unknown:            {} session(s) (missing or partial historical pricing)"))
         if cost_lines:
             lines += self._section("💰 Cost") + cost_lines + [""]
         if report["models"]:
@@ -561,7 +564,7 @@ class InsightsEngine:
         if o["total_hours"] > 0:
             lines.append(f"**Active time:** ~{format_duration_compact(o['total_hours'] * 3600)} | **Avg session:** ~{format_duration_compact(o['avg_session_duration'])}")
         lines.append("")
-        cost_parts = self._cost_lines(o, ("{} estimated", "{} included (subscription)", "{} unknown"))
+        cost_parts = self._cost_lines(o, ("{} estimated", "{} included (subscription)", "{} unknown (missing/partial pricing)"))
         if cost_parts:
             lines += [f"**Cost:** {' | '.join(cost_parts)}", ""]
         if report["models"]:

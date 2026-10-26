@@ -20,13 +20,16 @@ _TOKEN_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_
 def _token_update_sql(delta: bool) -> str:
     """``UPDATE sessions`` for one usage report: *delta* adds to the stored counters (CLI
     per-call path), otherwise sets them (gateway cumulative path). Cost/route columns
-    COALESCE-fill either way (statement text is pinned by the SQL trace harness)."""
+    COALESCE-fill either way. Unknown cost coverage is sticky: a later priced
+    call cannot retroactively price earlier usage."""
     def add(col: str) -> str:  # "col + ?" / "COALESCE(col, 0) + ?" in delta mode, bare "?" otherwise
         return f"{col} + ?" if delta else "?"
     def add0(col: str) -> str:
         return f"COALESCE({col}, 0) + ?" if delta else "?"
     counters = "".join(f"                   {c} = {add(c)},\n" for c in _TOKEN_COUNTERS)
     estimated = "COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0)" if delta else "COALESCE(?, 0)"
+    prior_usage = " OR ".join(f"COALESCE({c}, 0) != 0" for c in (
+        *_TOKEN_COUNTERS, "api_call_count", "estimated_cost_usd", "actual_cost_usd"))
     return (
         "UPDATE sessions SET\n" + counters
         + f"""                   estimated_cost_usd = {estimated},
@@ -34,7 +37,11 @@ def _token_update_sql(delta: bool) -> str:
                        WHEN ? IS NULL THEN actual_cost_usd
                        ELSE {add0("actual_cost_usd")}
                    END,
-                   cost_status = COALESCE(?, cost_status),
+                   cost_status = CASE
+                       WHEN COALESCE(cost_status, 'unknown') = 'unknown'
+                            AND ({prior_usage}) THEN 'unknown'
+                       ELSE COALESCE(?, cost_status)
+                   END,
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
                    billing_provider = COALESCE(billing_provider, ?),
@@ -66,7 +73,11 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
                    reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
                    estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
                    actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   cost_status = CASE
+                       WHEN COALESCE(cost_status, 'unknown') = 'unknown'
+                            OR COALESCE(excluded.cost_status, 'unknown') = 'unknown' THEN 'unknown'
+                       ELSE excluded.cost_status
+                   END,
                    cost_source = COALESCE(excluded.cost_source, cost_source),
                    last_seen = excluded.last_seen"""
 
@@ -293,6 +304,9 @@ class SessionUsageMixin:
         has_usage = bool(input_tokens or output_tokens or cache_read_tokens or cache_write_tokens or reasoning_tokens
                          or api_call_count or estimated_cost_usd)
         has_accounted_usage = bool(has_usage or actual_cost_usd)
+        if has_accounted_usage and cost_status is None:
+            cost_status = "unknown"
+            usage["cost_status"] = cost_status
         params = (
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
             estimated_cost_usd, actual_cost_usd, actual_cost_usd, cost_status, cost_source, pricing_version,
@@ -357,6 +371,10 @@ class SessionUsageMixin:
         sess = dict(row) if (row is not None and not task) else {}
         counts = [v or 0 for v in (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)]
         now = time.time()
+        # Auxiliary writers carry an optional estimate, but no status argument.
+        # A missing estimate is not permission for Insights to price the aggregate.
+        if task and cost_status is None:
+            cost_status = "estimated" if estimated_cost_usd is not None else "unknown"
         conn.execute(_MODEL_USAGE_UPSERT_SQL, (
             session_id, model or sess.get("model") or "unknown",
             billing_provider or sess.get("billing_provider") or "",

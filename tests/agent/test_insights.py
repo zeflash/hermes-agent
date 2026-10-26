@@ -10,6 +10,8 @@ from agent.insights import (
     _bar_chart,
 )
 from agent.usage_pricing import (
+    CanonicalUsage,
+    estimate_usage_cost,
     format_duration_compact as _format_duration,
     has_known_pricing as _has_known_pricing,
 )
@@ -493,13 +495,19 @@ class TestEdgeCases:
         assert models[0]["has_pricing"] is False
 
     def test_mixed_commercial_and_custom_models(self, db):
-        """Mix of commercial and custom models: only commercial ones get costs."""
+        """Only costs estimated at call time contribute, not unknown local usage."""
+        cost = estimate_usage_cost(
+            "anthropic/claude-sonnet-4-20250514",
+            CanonicalUsage(input_tokens=10000, output_tokens=5000), provider="anthropic",
+        )
         db.create_session(session_id="s1", source="cli", model="anthropic/claude-sonnet-4-20250514")
         db.update_token_counts(
             "s1",
             input_tokens=10000,
             output_tokens=5000,
             billing_provider="anthropic",
+            estimated_cost_usd=float(cost.amount_usd),
+            cost_status=cost.status,
         )
         db.create_session(session_id="s2", source="cli", model="my-local-llama")
         db.update_token_counts("s2", input_tokens=10000, output_tokens=5000)
@@ -508,7 +516,7 @@ class TestEdgeCases:
         engine = InsightsEngine(db)
         report = engine.generate(days=30)
 
-        # Cost should only come from gpt-4o, not from the custom model
+        # Cost should only come from the persisted Claude estimate.
         overview = report["overview"]
         assert overview["estimated_cost"] > 0
         assert "claude-sonnet-4-20250514" in overview["models_with_pricing"]  # list now, not set
